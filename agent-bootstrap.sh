@@ -19,7 +19,7 @@ fi
 
 # update the system and install python3
 sudo apt update
-sudo apt install python3-full git
+sudo apt install python3-full python3.13-venv git
 
 # clone the repo
 git clone https://github.com/ninevoltz/tiny-agent.git
