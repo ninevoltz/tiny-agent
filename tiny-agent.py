@@ -4,6 +4,8 @@ import re
 import subprocess
 import sys
 import atexit
+import json
+import requests
 
 try:
     import ollama
@@ -20,10 +22,13 @@ except ImportError:
     import readline
 
 # Configuration Constants
-DEFAULT_BASE_URL = "http://localhost:11434"
-DEFAULT_MODEL = "qwen3.5:27b"  # Ensure this model is pulled in Ollama
-MAX_AGENT_LOOPS = 5       # Prevent infinite command loops
-SHELL_TIMEOUT = 10        # Seconds allowed for a shell command
+DEFAULT_OLLAMA_URL = "http://localhost:11434"
+DEFAULT_MODEL = "qwen3.5:27b"
+DEFAULT_SEARXNG_URL = "http://localhost:8888/"  # SearXNG default port [3][13]
+MAX_AGENT_LOOPS = 100
+SHELL_TIMEOUT = 60
+SEARCH_TIMEOUT = 30
+MAX_SEARCH_RESULTS = 25
 
 def setup_readline():
     """Configure standard readline if prompt_toolkit is not available."""
@@ -43,19 +48,16 @@ def get_user_input(prompt_text="> "):
 
 def create_ollama_client(base_url):
     """Create an Ollama client with custom base URL."""
-    # The Ollama client supports custom base URL configuration [1]
     return ollama.Client(host=base_url)
 
 def stream_ollama_response(client, model, messages, system_prompt):
-    """Sends messages to Ollama and streams the response using the official client."""
-    # Configure messages with system prompt
+    """Sends messages to Ollama and streams the response."""
     chat_messages = [
         {"role": "system", "content": system_prompt}
     ] + messages
 
     full_content = ""
     try:
-        # Use the streaming feature from the ollama Python library [11]
         stream = client.chat(
             model=model,
             messages=chat_messages,
@@ -100,50 +102,107 @@ def parse_shell_command(content):
         return match.group(1).strip()
     return None
 
+def execute_web_search(query, searxng_url, max_results=MAX_SEARCH_RESULTS):
+    """
+    Executes a web search using SearXNG API.
+    SearXNG needs JSON format enabled for API access [13][26]
+    """
+    print(f"\n[Agent] Searching: {query}\n")
+
+    # SearXNG API endpoint - needs format=json [3][26]
+    search_url = f"{searxng_url}/search?q={query}&format=json"
+
+    try:
+        response = requests.get(
+            search_url,
+            timeout=SEARCH_TIMEOUT,
+            headers={'User-Agent': 'Mozilla/5.0'}  # Helps avoid 403 errors [21]
+        )
+
+        if response.status_code != 200:
+            return False, f"Search request failed with status {response.status_code}"
+
+        data = response.json()
+        results = data.get('results', [])[:max_results]
+
+        if not results:
+            return False, "No search results found."
+
+        # Format results for the model
+        formatted_results = []
+        for i, result in enumerate(results, 1):
+            title = result.get('title', 'No title')
+            url = result.get('url', 'No URL')
+            snippet = result.get('content', 'No description')[:200]  # Truncate for context
+            formatted_results.append(f"[{i}] {title}\nURL: {url}\nSnippet: {snippet}\n")
+
+        output = "Search Results:\n" + "=" * 50 + "\n" + "\n".join(formatted_results)
+        print(f"{output}\n" + "=" * 50 + "\n")
+
+        return True, output
+
+    except requests.exceptions.Timeout:
+        return False, f"Search request timed out (exceeded {SEARCH_TIMEOUT}s)."
+    except json.JSONDecodeError:
+        return False, "SearXNG did not return valid JSON. Ensure format=json is supported."
+    except Exception as e:
+        return False, f"Search execution failed: {str(e)}"
+
+def parse_web_search(content):
+    """Extracts the web search query if present."""
+    pattern = r'<do_web_search>(.*?)</do_web_search>'
+    match = re.search(pattern, content, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return None
+
 def main():
-    parser = argparse.ArgumentParser(description="Ollama CLI Harness with Shell Execution")
-    parser.add_argument('--base-url', default=DEFAULT_BASE_URL,
-                       help=f"Ollama API URL (default: {DEFAULT_BASE_URL})")
+    parser = argparse.ArgumentParser(description="Ollama CLI Harness with Shell Execution and Web Search")
+    parser.add_argument('--base-url', default=DEFAULT_OLLAMA_URL,
+                       help=f"Ollama API URL (default: {DEFAULT_OLLAMA_URL})")
     parser.add_argument('--model', default=DEFAULT_MODEL,
                        help=f"Model name (default: {DEFAULT_MODEL})")
+    parser.add_argument('--searxng-url', default=DEFAULT_SEARXNG_URL,
+                       help=f"SearXNG API URL (default: {DEFAULT_SEARXNG_URL})")
     args = parser.parse_args()
 
-    base_url = args.base_url
+    ollama_base_url = args.base_url
     model = args.model
+    searxng_url = args.searxng_url
 
-    # Verify the ollama client is available
     if not HAS_OLLAMA_CLIENT:
         print("[Error] The ollama Python client is not installed.")
         print("Please install it with: pip install ollama")
         sys.exit(1)
 
-    # Setup CLI History
     setup_readline()
 
-    # System Prompt Definition
+    # System Prompt with Web Search Capability
     system_instruction = (
-        "You are an AI assistant with access to the user's command line shell.\n"
-        "If you need to perform a shell task, wrap the command in <do_shell_command>COMMAND_HERE</do_shell_command>.\n"
-        "I will execute this command automatically.\n"
-        "The output of the command will be provided to you immediately.\n"
-        "After the shell output is provided, I will send <agent_may_continue>.\n"
+        "You are an AI assistant with access to the user's command line shell and the internet.\n"
+        "1. For shell tasks, wrap commands in <do_shell_command>COMMAND_HERE</do_shell_command>\n"
+        "2. For web search, wrap queries in <do_web_search>QUERY_HERE</do_web_search>\n"
+        "I will execute these automatically and provide the output to you.\n"
+        "After execution, I will send <agent_may_continue>.\n"
         "Do not wait for user input unless you need more information or have finished the task.\n"
-        "Ensure commands are safe. Do not run destructive commands like 'rm -rf'."
+        "For web searches, be specific and concise with queries.\n"
+        "Ensure shell commands are safe. Do not run destructive commands like 'rm -rf'."
     )
 
-    # Initialize Conversation History
     messages = []
+    client = create_ollama_client(ollama_base_url)
 
-    # Create the Ollama client with custom base URL [4]
-    client = create_ollama_client(base_url)
+    print(f"\n[Info] Connected to Ollama at {ollama_base_url} using model {model}")
+    print(f"[Info] Connected to SearXNG at {searxng_url}")
+    print(f"[Info] Type 'exit' to quit.")
+    print(f"[Info] Agent will execute <do_shell_command> and <do_web_search>...\n")
 
-    print(f"\n[Info] Connected to Ollama at {base_url} using model {model}\n"
-          f"[Info] Type 'exit' to quit.\n"
-          f"[Info] Agent will execute commands wrapped in <do_shell_command>...\n")
+    # SearXNG Configuration Note
+    print(f"[Info] Note: Ensure SearXNG has JSON format enabled in settings.yml")
+    print(f"[Info] If you get 403 errors, check SearXNG documentation [3][21]\n")
 
     try:
         while True:
-            # Get User Input
             human_input = get_user_input("You > ")
             if human_input.lower() == 'exit':
                 print("Goodbye!")
@@ -152,50 +211,50 @@ def main():
             if not human_input.strip():
                 continue
 
-            # Add user message to history
             messages.append({"role": "user", "content": human_input})
 
-            # Agent Loop - allows multiple shell commands in a row
             agent_loop_count = 0
 
             while True:
-                # Call Ollama using the official client library [9]
                 response_content = stream_ollama_response(client, model, messages, system_instruction)
 
                 if not response_content:
                     break
 
-                # Add assistant response to history
                 messages.append({"role": "assistant", "content": response_content})
 
                 # Check for Shell Command
                 shell_cmd = parse_shell_command(response_content)
 
-                if shell_cmd:
+                # Check for Web Search
+                web_search_query = parse_web_search(response_content)
+
+                if shell_cmd or web_search_query:
                     agent_loop_count += 1
                     if agent_loop_count > MAX_AGENT_LOOPS:
                         print(f"\n[Warning] Max agent loops ({MAX_AGENT_LOOPS}) reached. Returning control to user.")
                         break
 
-                    print("-" * 40)
-                    # Execute the command
-                    success, output = execute_shell_command(shell_cmd)
-                    print(f"Result: {output}\n" + "-" * 40)
+                    output = ""
+                    if shell_cmd:
+                        success, output = execute_shell_command(shell_cmd)
+                    if web_search_query:
+                        success, output = execute_web_search(web_search_query, searxng_url)
 
-                    # Prepare the response to send back to the model
-                    agent_feedback = f"{output}\n<agent_may_continue>"
+                    if output:
+                        # Prepare the response to send back to the model
+                        agent_feedback = f"{output}\n<agent_may_continue>"
 
-                    # Add feedback to history
-                    messages.append({
-                        "role": "user",
-                        "content": agent_feedback
-                    })
+                        messages.append({
+                            "role": "user",
+                            "content": agent_feedback
+                        })
 
-                    # Continue loop for next instruction
-                    continue
-                else:
-                    # No command detected, finish turn
-                    break
+                        # Continue loop for next instruction
+                        continue
+
+                # No command detected, finish turn
+                break
 
     except KeyboardInterrupt:
         print("\n[Info] Interrupted. Goodbye.")
