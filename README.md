@@ -4,6 +4,9 @@ A shell agent for use with Ollama, running local open-weights models. No guardra
 
 Written entirely by Qwen3.5:27b running on Ollama, on my i9-13900k 128GB + RTX 4090 rig.
 
+Install it with:
+curl -fsSl https://raw.githubusercontent.com/ninevoltz/tiny-agent/refs/heads/main/agent-bootstrap.sh | sh
+
 Notes discovered along the way:
 
 sudo systemctl edit ollama.service
