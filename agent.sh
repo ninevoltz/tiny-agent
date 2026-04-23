@@ -6,6 +6,6 @@ cd ${PROJECT_PATH}
 cd searxng
 nohup ./manage webapp.run > searxng.log 2>&1 &
 cd ..
-python tiny-agent.py --base-url  http://192.168.3.74:11434 --model qwen3.6:27b
+python tiny-agent.py --base-url  http://192.168.3.74:11434 --model gpt-oss:20b
 
 killall searxng

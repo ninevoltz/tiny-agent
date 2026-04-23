@@ -127,7 +127,7 @@ def parse_shell_command(content):
     pattern = r'<do_shell_command>(.*?)</do_shell_command>'
     match = re.search(pattern, content, re.DOTALL)
     if match and not FUNCTION_ACTIVE:
-        FUNCTION_ACTIVE = False
+        FUNCTION_ACTIVE = True
         return match.group(1).strip()
     return None
 
@@ -222,7 +222,6 @@ def main():
 
     # System Prompt updated for Vision
     system_instruction = (
-        "You are a vision capable multi-modal model, named qwen3.6:35b.\n"
         "You have access to the user's command line shell, the internet, and the ability to view images.\n"
         "1. For shell tasks, wrap commands in <do_shell_command>COMMAND_HERE</do_shell_command>\n"
         "2. For web search, wrap queries in <do_web_search>QUERY_HERE</do_web_search>\n"
